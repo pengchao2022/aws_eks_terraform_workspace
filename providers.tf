@@ -12,12 +12,6 @@ terraform {
     }
   }
 
-  backend "s3" {
-    # 根据实际情况配置S3后端
-    bucket = "terraformstatefile090909"
-    key    = "eks-python-cluster/terraform.tfstate"
-    region = "us-east-1"
-  }
 }
 
 provider "aws" {
