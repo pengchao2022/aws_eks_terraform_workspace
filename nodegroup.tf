@@ -1,7 +1,7 @@
 # nodegroup.tf (更新后的版本)
 resource "aws_eks_node_group" "this" {
   cluster_name    = module.eks.cluster_name
-  node_group_name = "${local.name}-node-group"  # 保持明确命名
+  node_group_name = eks-py-cluster-dev-node-group
   node_role_arn   = aws_iam_role.eks_node.arn
   subnet_ids      = var.subnet_ids
 
