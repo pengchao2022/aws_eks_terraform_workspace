@@ -20,10 +20,15 @@ on:
         options:
         - plan
         - apply
-        - destroy  # 添加 destroy 选项
+        - destroy
 
 env:
   AWS_REGION: us-east-1
+  TF_WORKSPACE: ${{ github.event.inputs.environment }}
+  # 从后端配置中获取或设置默认值
+  TF_STATE_BUCKET: "terraformstatefile090909"
+  TF_STATE_KEY: "env:/${{ github.event.inputs.environment }}/eks-python-cluster/terraform.tfstate"
+  DYNAMODB_LOCK_TABLE: "terraform-locks"  # 根据实际情况修改
 
 jobs:
   deploy:
@@ -46,41 +51,115 @@ jobs:
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ${{ env.AWS_REGION }}
 
+    - name: Extract DynamoDB table name from backend config
+      id: get-dynamodb-table
+      run: |
+        # 从 backend.tf 或 terraform 配置中提取 DynamoDB 表名
+        if [ -f "backend.tf" ]; then
+          TABLE_NAME=$(grep -A5 -B5 "dynamodb_table" backend.tf | grep -oP 'dynamodb_table\s*=\s*"\K[^"]+' || echo "$DYNAMODB_LOCK_TABLE")
+        else
+          TABLE_NAME="$DYNAMODB_LOCK_TABLE"
+        fi
+        echo "table_name=$TABLE_NAME" >> $GITHUB_OUTPUT
+        echo "Using DynamoDB table: $TABLE_NAME"
+
+    - name: Check for existing DynamoDB locks
+      id: check-dynamodb-lock
+      run: |
+        LOCK_KEY="$TF_STATE_KEY-md5"
+        echo "Checking for DynamoDB lock with key: $LOCK_KEY"
+        
+        # 检查 DynamoDB 中是否有锁
+        LOCK_EXISTS=$(aws dynamodb get-item \
+          --table-name ${{ steps.get-dynamodb-table.outputs.table_name }} \
+          --key "{\"LockID\": {\"S\": \"$LOCK_KEY\"}}" \
+          --query 'Item' \
+          --output text 2>/dev/null || echo "false")
+        
+        if [ "$LOCK_EXISTS" != "false" ] && [ ! -z "$LOCK_EXISTS" ]; then
+          echo "lock_exists=true" >> $GITHUB_OUTPUT
+          LOCK_INFO=$(aws dynamodb get-item \
+            --table-name ${{ steps.get-dynamodb-table.outputs.table_name }} \
+            --key "{\"LockID\": {\"S\": \"$LOCK_KEY\"}}" \
+            --query 'Item' \
+            --output json)
+          echo "lock_info=$LOCK_INFO" >> $GITHUB_OUTPUT
+          echo "⚠️  Existing DynamoDB lock detected for key: $LOCK_KEY"
+          echo "Lock info: $LOCK_INFO"
+        else
+          echo "lock_exists=false" >> $GITHUB_OUTPUT
+          echo "✅ No existing DynamoDB locks found"
+        fi
+
+    - name: Cleanup stale DynamoDB lock (if exists)
+      if: steps.check-dynamodb-lock.outputs.lock_exists == 'true'
+      run: |
+        LOCK_KEY="$TF_STATE_KEY-md5"
+        echo "🔄 Cleaning up stale DynamoDB lock: $LOCK_KEY"
+        
+        # 删除 DynamoDB 中的锁
+        aws dynamodb delete-item \
+          --table-name ${{ steps.get-dynamodb-table.outputs.table_name }} \
+          --key "{\"LockID\": {\"S\": \"$LOCK_KEY\"}}" \
+          --return-consumed-capacity TOTAL
+        
+        echo "✅ DynamoDB lock cleaned up successfully"
+
     - name: Terraform Init
-      run: terraform init -input=false
+      run: terraform init -input=false -reconfigure
 
     - name: Setup Terraform Workspace
       run: |
-        terraform workspace select ${{ github.event.inputs.environment }} || terraform workspace new ${{ github.event.inputs.environment }}
+        terraform workspace select ${{ env.TF_WORKSPACE }} || terraform workspace new ${{ env.TF_WORKSPACE }}
         echo "Current workspace: $(terraform workspace show)"
 
     - name: Validate tfvars File Exists
       run: |
-        if [ ! -f "${{ github.event.inputs.environment }}.tfvars" ]; then
-          echo "Error: ${{ github.event.inputs.environment }}.tfvars file not found!"
+        if [ ! -f "${{ env.TF_WORKSPACE }}.tfvars" ]; then
+          echo "Error: ${{ env.TF_WORKSPACE }}.tfvars file not found!"
           exit 1
         fi
-        echo "Using tfvars file: ${{ github.event.inputs.environment }}.tfvars"
+        echo "Using tfvars file: ${{ env.TF_WORKSPACE }}.tfvars"
+
+    - name: Check for existing Terraform state locks
+      id: check-state-lock
+      run: |
+        # 检查 Terraform 状态中是否有锁
+        if terraform state pull 2>/dev/null | grep -q "lock-info"; then
+          echo "lock_exists=true" >> $GITHUB_OUTPUT
+          LOCK_ID=$(terraform state pull 2>/dev/null | jq -r '.["lock-info"].ID // empty' || echo "")
+          echo "lock_id=$LOCK_ID" >> $GITHUB_OUTPUT
+          echo "⚠️  Existing state lock detected: $LOCK_ID"
+        else
+          echo "lock_exists=false" >> $GITHUB_OUTPUT
+          echo "✅ No existing state locks found"
+        fi
+
+    - name: Cleanup stale Terraform state lock (if exists)
+      if: steps.check-state-lock.outputs.lock_exists == 'true'
+      run: |
+        echo "🔄 Cleaning up stale Terraform state lock: ${{ steps.check-state-lock.outputs.lock_id }}"
+        terraform force-unlock -force ${{ steps.check-state-lock.outputs.lock_id }} || echo "State lock cleanup attempted"
 
     - name: Terraform Plan
       if: github.event.inputs.action == 'plan'
       run: |
         terraform plan \
-          -var-file=${{ github.event.inputs.environment }}.tfvars \
+          -var-file=${{ env.TF_WORKSPACE }}.tfvars \
           -out=tfplan
 
     - name: Terraform Apply
       if: github.event.inputs.action == 'apply'
       run: |
         terraform apply \
-          -var-file=${{ github.event.inputs.environment }}.tfvars \
+          -var-file=${{ env.TF_WORKSPACE }}.tfvars \
           -auto-approve
 
     - name: Terraform Destroy Plan
       if: github.event.inputs.action == 'destroy'
       run: |
         terraform plan -destroy \
-          -var-file=${{ github.event.inputs.environment }}.tfvars \
+          -var-file=${{ env.TF_WORKSPACE }}.tfvars \
           -out=destroy-plan
         echo "Destroy plan generated. Review before proceeding."
 
@@ -88,17 +167,15 @@ jobs:
       if: github.event.inputs.action == 'destroy'
       run: |
         terraform destroy \
-          -var-file=${{ github.event.inputs.environment }}.tfvars \
+          -var-file=${{ env.TF_WORKSPACE }}.tfvars \
           -auto-approve
       env:
-        # 为 destroy 操作添加确认环境变量
         TF_CONFIRM_DESTROY: 1
 
     - name: Update Kubeconfig
       if: github.event.inputs.action == 'apply'
       run: |
-        # 从 tfvars 文件中提取集群名称
-        CLUSTER_NAME=$(grep 'cluster_name' ${{ github.event.inputs.environment }}.tfvars | awk -F'=' '{print $2}' | tr -d ' "')
+        CLUSTER_NAME=$(grep 'cluster_name' ${{ env.TF_WORKSPACE }}.tfvars | awk -F'=' '{print $2}' | tr -d ' "')
         aws eks update-kubeconfig \
           --region ${{ env.AWS_REGION }} \
           --name $CLUSTER_NAME
@@ -116,4 +193,65 @@ jobs:
       if: github.event.inputs.action == 'destroy'
       run: |
         echo "✅ Terraform destroy completed successfully"
-        echo "All resources in environment '${{ github.event.inputs.environment }}' have been destroyed"
+        echo "All resources in environment '${{ env.TF_WORKSPACE }}' have been destroyed"
+
+    - name: Cleanup DynamoDB lock on completion
+      if: always()
+      run: |
+        echo "🧹 Final DynamoDB lock cleanup..."
+        LOCK_KEY="$TF_STATE_KEY-md5"
+        
+        # 检查并清理 DynamoDB 锁
+        LOCK_EXISTS=$(aws dynamodb get-item \
+          --table-name ${{ steps.get-dynamodb-table.outputs.table_name }} \
+          --key "{\"LockID\": {\"S\": \"$LOCK_KEY\"}}" \
+          --query 'Item' \
+          --output text 2>/dev/null || echo "false")
+        
+        if [ "$LOCK_EXISTS" != "false" ] && [ ! -z "$LOCK_EXISTS" ]; then
+          echo "Removing residual DynamoDB lock: $LOCK_KEY"
+          aws dynamodb delete-item \
+            --table-name ${{ steps.get-dynamodb-table.outputs.table_name }} \
+            --key "{\"LockID\": {\"S\": \"$LOCK_KEY\"}}"
+          echo "✅ Residual DynamoDB lock cleaned up"
+        else
+          echo "✅ No residual DynamoDB locks found"
+        fi
+
+    - name: Cleanup Terraform state lock on completion
+      if: always()
+      run: |
+        echo "🧹 Final Terraform state lock cleanup..."
+        # 尝试清理任何可能残留的状态锁
+        LOCK_INFO=$(terraform state pull 2>/dev/null | jq -r '.["lock-info"].ID // empty' || echo "")
+        if [ ! -z "$LOCK_INFO" ]; then
+          echo "Removing residual state lock: $LOCK_INFO"
+          terraform force-unlock -force $LOCK_INFO || echo "No residual state locks found"
+        else
+          echo "✅ No residual state locks found"
+        fi
+
+    - name: Verify all locks are cleaned up
+      if: always()
+      run: |
+        echo "🔍 Verifying all locks have been cleaned up..."
+        
+        # 检查 DynamoDB
+        LOCK_KEY="$TF_STATE_KEY-md5"
+        DYNAMO_LOCK=$(aws dynamodb get-item \
+          --table-name ${{ steps.get-dynamodb-table.outputs.table_name }} \
+          --key "{\"LockID\": {\"S\": \"$LOCK_KEY\"}}" \
+          --query 'Item' \
+          --output text 2>/dev/null || echo "none")
+        
+        # 检查 Terraform 状态
+        STATE_LOCK=$(terraform state pull 2>/dev/null | jq -r '.["lock-info"] // empty' || echo "none")
+        
+        if [ "$DYNAMO_LOCK" = "none" ] && [ -z "$STATE_LOCK" ]; then
+          echo "✅ All locks verified as cleaned up"
+        else
+          echo "⚠️  WARNING: Some locks may still exist"
+          echo "DynamoDB lock: $([ "$DYNAMO_LOCK" != "none" ] && echo "exists" || echo "cleaned")"
+          echo "State lock: $([ ! -z "$STATE_LOCK" ] && echo "exists" || echo "cleaned")"
+          # 不退出失败，只是警告
+        fi
