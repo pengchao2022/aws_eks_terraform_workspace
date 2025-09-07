@@ -5,20 +5,17 @@ module "eks" {
 
   cluster_name    = local.name
   cluster_version = var.cluster_version
-  iam_role_arn    = aws_iam_role.eks_cluster.arn  # 现在这个资源已定义
+  iam_role_arn    = aws_iam_role.eks_cluster.arn
 
   cluster_endpoint_public_access = true
 
   vpc_id     = var.vpc_id
   subnet_ids = var.subnet_ids
 
-  # 不定义任何节点组，使用外部的 aws_eks_node_group 资源
-  eks_managed_node_groups = {}
+  eks_managed_node_groups = {} # 使用外部的 aws_eks_node_group 资源
 
   cluster_addons = {
-    coredns = {
-      most_recent = true
-    }
+    coredns = null # 关键修改：显式设置为 null 以禁用 CoreDNS 安装
     kube-proxy = {
       most_recent = true
     }
