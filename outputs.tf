@@ -24,14 +24,49 @@ output "cluster_name" {
   value       = module.eks.cluster_name
 }
 
-output "node_group_arn" {
-  description = "Node group ARN"
-  value       = module.eks.eks_managed_node_groups["python-nodes"].iam_role_arn
+output "cluster_certificate_authority_data" {
+  description = "Base64 encoded certificate authority data for cluster"
+  value       = module.eks.cluster_certificate_authority_data
 }
 
-# 获取 kubeconfig 的正确方式
+output "oidc_provider_arn" {
+  description = "OIDC provider ARN"
+  value       = module.eks.oidc_provider_arn
+}
+
+output "cluster_oidc_issuer_url" {
+  description = "OIDC issuer URL"
+  value       = module.eks.cluster_oidc_issuer_url
+}
+
 output "kubeconfig" {
   description = "kubectl config file contents"
-  value       = module.eks.kubeconfig
+  value       = module.eks.kubeconfig_raw  # 修正为 kubeconfig_raw
   sensitive   = true
+}
+
+output "node_group_ids" {
+  description = "Node group IDs"
+  value       = [for ng in module.eks.eks_managed_node_groups : ng.node_group_id]
+}
+
+output "node_group_arns" {
+  description = "Node group ARNs"
+  value       = [for ng in module.eks.eks_managed_node_groups : ng.node_group_arn]
+}
+
+# 新增一些有用的输出
+output "cluster_version" {
+  description = "Kubernetes cluster version"
+  value       = module.eks.cluster_version
+}
+
+output "cluster_status" {
+  description = "Cluster status"
+  value       = module.eks.cluster_status
+}
+
+output "cluster_platform_version" {
+  description = "Cluster platform version"
+  value       = module.eks.cluster_platform_version
 }
