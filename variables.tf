@@ -1,3 +1,4 @@
+# variables.tf
 variable "region" {
   description = "AWS region"
   type        = string
@@ -23,7 +24,7 @@ variable "subnet_ids" {
 variable "cluster_name" {
   description = "EKS cluster name"
   type        = string
-  default     = "eks-python-cluster"
+  default     = "eks-py-cluster"
 }
 
 variable "cluster_version" {
@@ -56,8 +57,4 @@ variable "min_size" {
   default     = 1
 }
 
-variable "ubuntu_ami_id" {
-  description = "Ubuntu AMI ID for worker nodes"
-  type        = string
-  default     = ""
-}
+# 移除了 ssh_key_name 变量
