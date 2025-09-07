@@ -21,10 +21,6 @@ resource "aws_eks_node_group" "this" {
     node-type   = "python-worker"
   }
 
-  remote_access {
-    ec2_ssh_key = "your-ssh-key-name"  # 替换为您的SSH密钥名称
-  }
-
   tags = {
     "Name" = "${local.name}-node"
     "k8s.io/cluster-autoscaler/enabled" = "true"
