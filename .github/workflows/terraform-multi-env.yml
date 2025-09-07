@@ -24,11 +24,9 @@ on:
 
 env:
   AWS_REGION: us-east-1
-  TF_WORKSPACE: ${{ github.event.inputs.environment }}
-  # 从后端配置中获取或设置默认值
   TF_STATE_BUCKET: "terraformstatefile090909"
-  TF_STATE_KEY: "env:/${{ github.event.inputs.environment }}/eks-python-cluster/terraform.tfstate"
-  DYNAMODB_LOCK_TABLE: "terraform-locks"  # 根据实际情况修改
+  TF_STATE_KEY_PREFIX: "env"
+  DYNAMODB_LOCK_TABLE: "terraform-locks"
 
 jobs:
   deploy:
@@ -43,6 +41,8 @@ jobs:
       uses: hashicorp/setup-terraform@v3
       with:
         terraform_version: "1.5.0"
+        # 禁用自动设置 TF_WORKSPACE
+        terraform_wrapper: false
 
     - name: Configure AWS credentials
       uses: aws-actions/configure-aws-credentials@v4
@@ -51,16 +51,28 @@ jobs:
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ${{ env.AWS_REGION }}
 
+    - name: Set environment variables
+      run: |
+        # 设置工作区相关的环境变量
+        ENVIRONMENT="${{ github.event.inputs.environment }}"
+        TF_STATE_KEY="$TF_STATE_KEY_PREFIX:/$ENVIRONMENT/eks-python-cluster/terraform.tfstate"
+        echo "TF_WORKSPACE=$ENVIRONMENT" >> $GITHUB_ENV
+        echo "TF_STATE_KEY=$TF_STATE_KEY" >> $GITHUB_ENV
+        echo "Using workspace: $ENVIRONMENT"
+        echo "State key: $TF_STATE_KEY"
+
     - name: Extract DynamoDB table name from backend config
       id: get-dynamodb-table
       run: |
         # 从 backend.tf 或 terraform 配置中提取 DynamoDB 表名
         if [ -f "backend.tf" ]; then
-          TABLE_NAME=$(grep -A5 -B5 "dynamodb_table" backend.tf | grep -oP 'dynamodb_table\s*=\s*"\K[^"]+' || echo "$DYNAMODB_LOCK_TABLE")
+          TABLE_NAME=$(grep "dynamodb_table" backend.tf | grep -oP 'dynamodb_table\s*=\s*"\K[^"]+' || echo "$DYNAMODB_LOCK_TABLE")
+        elif [ -f "*.tf" ]; then
+          TABLE_NAME=$(grep -r "dynamodb_table" *.tf | head -1 | grep -oP 'dynamodb_table\s*=\s*"\K[^"]+' || echo "$DYNAMODB_LOCK_TABLE")
         else
           TABLE_NAME="$DYNAMODB_LOCK_TABLE"
         fi
-        echo "table_name=$TABLE_NAME" >> $GITHUB_OUTPUT
+        echo "table_name=${TABLE_NAME}" >> $GITHUB_OUTPUT
         echo "Using DynamoDB table: $TABLE_NAME"
 
     - name: Check for existing DynamoDB locks
@@ -83,9 +95,8 @@ jobs:
             --key "{\"LockID\": {\"S\": \"$LOCK_KEY\"}}" \
             --query 'Item' \
             --output json)
-          echo "lock_info=$LOCK_INFO" >> $GITHUB_OUTPUT
+          echo "lock_info=$(echo $LOCK_INFO | jq -c .)" >> $GITHUB_OUTPUT
           echo "⚠️  Existing DynamoDB lock detected for key: $LOCK_KEY"
-          echo "Lock info: $LOCK_INFO"
         else
           echo "lock_exists=false" >> $GITHUB_OUTPUT
           echo "✅ No existing DynamoDB locks found"
@@ -110,24 +121,36 @@ jobs:
 
     - name: Setup Terraform Workspace
       run: |
-        terraform workspace select ${{ env.TF_WORKSPACE }} || terraform workspace new ${{ env.TF_WORKSPACE }}
+        # 先列出所有工作区查看当前状态
+        echo "Available workspaces:"
+        terraform workspace list
+        
+        # 检查工作区是否已存在
+        if terraform workspace list | grep -q " $TF_WORKSPACE$"; then
+          echo "Workspace '$TF_WORKSPACE' already exists, selecting it..."
+          terraform workspace select $TF_WORKSPACE
+        else
+          echo "Creating new workspace: $TF_WORKSPACE"
+          terraform workspace new $TF_WORKSPACE
+        fi
         echo "Current workspace: $(terraform workspace show)"
 
     - name: Validate tfvars File Exists
       run: |
-        if [ ! -f "${{ env.TF_WORKSPACE }}.tfvars" ]; then
-          echo "Error: ${{ env.TF_WORKSPACE }}.tfvars file not found!"
+        if [ ! -f "$TF_WORKSPACE.tfvars" ]; then
+          echo "Error: $TF_WORKSPACE.tfvars file not found!"
           exit 1
         fi
-        echo "Using tfvars file: ${{ env.TF_WORKSPACE }}.tfvars"
+        echo "Using tfvars file: $TF_WORKSPACE.tfvars"
 
     - name: Check for existing Terraform state locks
       id: check-state-lock
       run: |
         # 检查 Terraform 状态中是否有锁
-        if terraform state pull 2>/dev/null | grep -q "lock-info"; then
+        STATE_OUTPUT=$(terraform state pull 2>/dev/null || echo "{}")
+        if echo "$STATE_OUTPUT" | grep -q "lock-info"; then
           echo "lock_exists=true" >> $GITHUB_OUTPUT
-          LOCK_ID=$(terraform state pull 2>/dev/null | jq -r '.["lock-info"].ID // empty' || echo "")
+          LOCK_ID=$(echo "$STATE_OUTPUT" | jq -r '.["lock-info"].ID // empty' || echo "")
           echo "lock_id=$LOCK_ID" >> $GITHUB_OUTPUT
           echo "⚠️  Existing state lock detected: $LOCK_ID"
         else
@@ -145,21 +168,21 @@ jobs:
       if: github.event.inputs.action == 'plan'
       run: |
         terraform plan \
-          -var-file=${{ env.TF_WORKSPACE }}.tfvars \
+          -var-file=$TF_WORKSPACE.tfvars \
           -out=tfplan
 
     - name: Terraform Apply
       if: github.event.inputs.action == 'apply'
       run: |
         terraform apply \
-          -var-file=${{ env.TF_WORKSPACE }}.tfvars \
+          -var-file=$TF_WORKSPACE.tfvars \
           -auto-approve
 
     - name: Terraform Destroy Plan
       if: github.event.inputs.action == 'destroy'
       run: |
         terraform plan -destroy \
-          -var-file=${{ env.TF_WORKSPACE }}.tfvars \
+          -var-file=$TF_WORKSPACE.tfvars \
           -out=destroy-plan
         echo "Destroy plan generated. Review before proceeding."
 
@@ -167,7 +190,7 @@ jobs:
       if: github.event.inputs.action == 'destroy'
       run: |
         terraform destroy \
-          -var-file=${{ env.TF_WORKSPACE }}.tfvars \
+          -var-file=$TF_WORKSPACE.tfvars \
           -auto-approve
       env:
         TF_CONFIRM_DESTROY: 1
@@ -175,9 +198,9 @@ jobs:
     - name: Update Kubeconfig
       if: github.event.inputs.action == 'apply'
       run: |
-        CLUSTER_NAME=$(grep 'cluster_name' ${{ env.TF_WORKSPACE }}.tfvars | awk -F'=' '{print $2}' | tr -d ' "')
+        CLUSTER_NAME=$(grep 'cluster_name' $TF_WORKSPACE.tfvars | awk -F'=' '{print $2}' | tr -d ' "')
         aws eks update-kubeconfig \
-          --region ${{ env.AWS_REGION }} \
+          --region $AWS_REGION \
           --name $CLUSTER_NAME
 
     - name: Output Cluster Info
@@ -187,13 +210,13 @@ jobs:
         echo "=== EKS Cluster Information ==="
         echo "Cluster Endpoint: $(terraform output -raw cluster_endpoint)"
         echo "Cluster Name: $(terraform output -raw cluster_name)"
-        echo "Cluster Region: ${{ env.AWS_REGION }}"
+        echo "Cluster Region: $AWS_REGION"
 
     - name: Destroy Completion Message
       if: github.event.inputs.action == 'destroy'
       run: |
         echo "✅ Terraform destroy completed successfully"
-        echo "All resources in environment '${{ env.TF_WORKSPACE }}' have been destroyed"
+        echo "All resources in environment '$TF_WORKSPACE' have been destroyed"
 
     - name: Cleanup DynamoDB lock on completion
       if: always()
@@ -223,7 +246,8 @@ jobs:
       run: |
         echo "🧹 Final Terraform state lock cleanup..."
         # 尝试清理任何可能残留的状态锁
-        LOCK_INFO=$(terraform state pull 2>/dev/null | jq -r '.["lock-info"].ID // empty' || echo "")
+        STATE_OUTPUT=$(terraform state pull 2>/dev/null || echo "{}")
+        LOCK_INFO=$(echo "$STATE_OUTPUT" | jq -r '.["lock-info"].ID // empty' || echo "")
         if [ ! -z "$LOCK_INFO" ]; then
           echo "Removing residual state lock: $LOCK_INFO"
           terraform force-unlock -force $LOCK_INFO || echo "No residual state locks found"
@@ -245,7 +269,8 @@ jobs:
           --output text 2>/dev/null || echo "none")
         
         # 检查 Terraform 状态
-        STATE_LOCK=$(terraform state pull 2>/dev/null | jq -r '.["lock-info"] // empty' || echo "none")
+        STATE_OUTPUT=$(terraform state pull 2>/dev/null || echo "{}")
+        STATE_LOCK=$(echo "$STATE_OUTPUT" | jq -r '.["lock-info"] // empty' || echo "none")
         
         if [ "$DYNAMO_LOCK" = "none" ] && [ -z "$STATE_LOCK" ]; then
           echo "✅ All locks verified as cleaned up"
@@ -253,5 +278,4 @@ jobs:
           echo "⚠️  WARNING: Some locks may still exist"
           echo "DynamoDB lock: $([ "$DYNAMO_LOCK" != "none" ] && echo "exists" || echo "cleaned")"
           echo "State lock: $([ ! -z "$STATE_LOCK" ] && echo "exists" || echo "cleaned")"
-          # 不退出失败，只是警告
         fi
