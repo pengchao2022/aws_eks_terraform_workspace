@@ -28,6 +28,11 @@ env:
   TF_STATE_KEY_PREFIX: "env"
   DYNAMODB_LOCK_TABLE: "terraform-locks"
 
+# 添加并发控制，防止同一环境同时部署
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.inputs.environment }}
+  cancel-in-progress: true
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -71,40 +76,66 @@ jobs:
         echo "table_name=${TABLE_NAME}" >> $GITHUB_OUTPUT
         echo "Using DynamoDB table: $TABLE_NAME"
 
-    - name: Check for existing DynamoDB locks
+    - name: Check for stale DynamoDB locks
       id: check-dynamodb-lock
       run: |
-        LOCK_KEY="$TF_STATE_KEY-md5"
-        echo "Checking for DynamoDB lock with key: $LOCK_KEY"
+        # 正确的 DynamoDB 锁 ID 格式：bucket/path-to-state-file-md5
+        LOCK_ID="$TF_STATE_BUCKET/$TF_STATE_KEY-md5"
+        echo "Checking for DynamoDB lock with ID: $LOCK_ID"
         
-        LOCK_EXISTS=$(aws dynamodb get-item \
+        # 获取锁信息
+        LOCK_INFO=$(aws dynamodb get-item \
           --table-name ${{ steps.get-dynamodb-table.outputs.table_name }} \
-          --key "{\"LockID\": {\"S\": \"$LOCK_KEY\"}}" \
-          --query 'Item' \
-          --output text 2>/dev/null || echo "false")
+          --key "{\"LockID\": {\"S\": \"$LOCK_ID\"}}" \
+          --output json 2>/dev/null || echo "{}")
         
-        if [ "$LOCK_EXISTS" != "false" ] && [ ! -z "$LOCK_EXISTS" ]; then
-          echo "lock_exists=true" >> $GITHUB_OUTPUT
-          echo "⚠️  Existing DynamoDB lock detected for key: $LOCK_KEY"
+        # 检查锁是否存在且是否过期（超过15分钟）
+        if echo "$LOCK_INFO" | jq -e '.Item' > /dev/null 2>&1; then
+          LOCK_TIME=$(echo "$LOCK_INFO" | jq -r '.Item.Info.S // empty' | jq -r '.Created // empty' 2>/dev/null | head -1 || echo "")
+          if [ ! -z "$LOCK_TIME" ]; then
+            # 转换时间格式并计算锁年龄
+            LOCK_EPOCH=$(date -d "$(echo "$LOCK_TIME" | sed 's/\.[0-9]*//')" +%s 2>/dev/null || echo 0)
+            CURRENT_EPOCH=$(date +%s)
+            LOCK_AGE=$((CURRENT_EPOCH - LOCK_EPOCH))
+            
+            if [ $LOCK_AGE -gt 900 ]; then # 15分钟
+              echo "lock_exists=true" >> $GITHUB_OUTPUT
+              echo "lock_id=$LOCK_ID" >> $GITHUB_OUTPUT
+              echo "lock_age=$LOCK_AGE" >> $GITHUB_OUTPUT
+              echo "⚠️  Stale DynamoDB lock detected (age: ${LOCK_AGE}s): $LOCK_ID"
+            else
+              echo "lock_exists=false" >> $GITHUB_OUTPUT
+              echo "✅ Active lock found (not stale), age: ${LOCK_AGE}s"
+            fi
+          else
+            echo "lock_exists=true" >> $GITHUB_OUTPUT
+            echo "lock_id=$LOCK_ID" >> $GITHUB_OUTPUT
+            echo "⚠️  DynamoDB lock with invalid timestamp: $LOCK_ID"
+          fi
         else
           echo "lock_exists=false" >> $GITHUB_OUTPUT
-          echo "✅ No existing DynamoDB locks found"
+          echo "✅ No DynamoDB locks found"
         fi
 
     - name: Cleanup stale DynamoDB lock (if exists)
       if: steps.check-dynamodb-lock.outputs.lock_exists == 'true'
       run: |
-        LOCK_KEY="$TF_STATE_KEY-md5"
-        echo "🔄 Cleaning up stale DynamoDB lock: $LOCK_KEY"
+        LOCK_ID="${{ steps.check-dynamodb-lock.outputs.lock_id }}"
+        echo "🔄 Cleaning up stale DynamoDB lock: $LOCK_ID (age: ${{ steps.check-dynamodb-lock.outputs.lock_age }}s)"
         
         aws dynamodb delete-item \
           --table-name ${{ steps.get-dynamodb-table.outputs.table_name }} \
-          --key "{\"LockID\": {\"S\": \"$LOCK_KEY\"}}"
+          --key "{\"LockID\": {\"S\": \"$LOCK_ID\"}}"
         
         echo "✅ DynamoDB lock cleaned up successfully"
 
-    - name: Terraform Init
-      run: terraform init -input=false -reconfigure
+    - name: Terraform Init with explicit backend config
+      run: |
+        terraform init -input=false -reconfigure \
+          -backend-config="bucket=$TF_STATE_BUCKET" \
+          -backend-config="key=$TF_STATE_KEY" \
+          -backend-config="dynamodb_table=${{ steps.get-dynamodb-table.outputs.table_name }}" \
+          -backend-config="region=$AWS_REGION"
 
     - name: Manage Terraform workspace without TF_WORKSPACE env
       id: workspace-setup
@@ -161,38 +192,42 @@ jobs:
         echo "🔄 Cleaning up stale Terraform state lock: ${{ steps.check-state-lock.outputs.lock_id }}"
         terraform force-unlock -force ${{ steps.check-state-lock.outputs.lock_id }} || echo "State lock cleanup attempted"
 
-    - name: Terraform Plan
+    - name: Terraform Plan with lock timeout
       if: github.event.inputs.action == 'plan'
       run: |
         unset TF_WORKSPACE
         terraform plan \
           -var-file=$ENVIRONMENT.tfvars \
-          -out=tfplan
+          -out=tfplan \
+          -lock-timeout=5m
 
-    - name: Terraform Apply
+    - name: Terraform Apply with lock timeout
       if: github.event.inputs.action == 'apply'
       run: |
         unset TF_WORKSPACE
         terraform apply \
           -var-file=$ENVIRONMENT.tfvars \
-          -auto-approve
+          -auto-approve \
+          -lock-timeout=10m
 
-    - name: Terraform Destroy Plan
+    - name: Terraform Destroy Plan with lock timeout
       if: github.event.inputs.action == 'destroy'
       run: |
         unset TF_WORKSPACE
         terraform plan -destroy \
           -var-file=$ENVIRONMENT.tfvars \
-          -out=destroy-plan
+          -out=destroy-plan \
+          -lock-timeout=5m
         echo "Destroy plan generated. Review before proceeding."
 
-    - name: Terraform Destroy
+    - name: Terraform Destroy with lock timeout
       if: github.event.inputs.action == 'destroy'
       run: |
         unset TF_WORKSPACE
         terraform destroy \
           -var-file=$ENVIRONMENT.tfvars \
-          -auto-approve
+          -auto-approve \
+          -lock-timeout=10m
       env:
         TF_CONFIRM_DESTROY: 1
 
@@ -224,19 +259,20 @@ jobs:
       if: always()
       run: |
         echo "🧹 Final DynamoDB lock cleanup..."
-        LOCK_KEY="$TF_STATE_KEY-md5"
+        # 使用正确的锁ID格式
+        LOCK_ID="$TF_STATE_BUCKET/$TF_STATE_KEY-md5"
         
         LOCK_EXISTS=$(aws dynamodb get-item \
           --table-name ${{ steps.get-dynamodb-table.outputs.table_name }} \
-          --key "{\"LockID\": {\"S\": \"$LOCK_KEY\"}}" \
+          --key "{\"LockID\": {\"S\": \"$LOCK_ID\"}}" \
           --query 'Item' \
           --output text 2>/dev/null || echo "false")
         
         if [ "$LOCK_EXISTS" != "false" ] && [ ! -z "$LOCK_EXISTS" ]; then
-          echo "Removing residual DynamoDB lock: $LOCK_KEY"
+          echo "Removing residual DynamoDB lock: $LOCK_ID"
           aws dynamodb delete-item \
             --table-name ${{ steps.get-dynamodb-table.outputs.table_name }} \
-            --key "{\"LockID\": {\"S\": \"$LOCK_KEY\"}}"
+            --key "{\"LockID\": {\"S\": \"$LOCK_ID\"}}"
           echo "✅ Residual DynamoDB lock cleaned up"
         else
           echo "✅ No residual DynamoDB locks found"
@@ -261,10 +297,11 @@ jobs:
       run: |
         echo "🔍 Verifying all locks have been cleaned up..."
         
-        LOCK_KEY="$TF_STATE_KEY-md5"
+        # 使用正确的锁ID格式
+        LOCK_ID="$TF_STATE_BUCKET/$TF_STATE_KEY-md5"
         DYNAMO_LOCK=$(aws dynamodb get-item \
           --table-name ${{ steps.get-dynamodb-table.outputs.table_name }} \
-          --key "{\"LockID\": {\"S\": \"$LOCK_KEY\"}}" \
+          --key "{\"LockID\": {\"S\": \"$LOCK_ID\"}}" \
           --query 'Item' \
           --output text 2>/dev/null || echo "none")
         
