@@ -1,19 +1,19 @@
-# eks.tf (简化版)
+# eks.tf
 module "eks" {
   source  = "terraform-aws-modules/eks/aws"
   version = "~> 19.0"
 
   cluster_name    = local.name
   cluster_version = var.cluster_version
-  iam_role_arn    = aws_iam_role.eks_cluster.arn
+  iam_role_arn    = aws_iam_role.eks_cluster.arn  # 现在这个资源已定义
 
   cluster_endpoint_public_access = true
 
   vpc_id     = var.vpc_id
   subnet_ids = var.subnet_ids
 
-  # 不定义任何节点组，模块就不会创建节点组
-  # 这样我们可以在外部使用 aws_eks_node_group 资源
+  # 不定义任何节点组，使用外部的 aws_eks_node_group 资源
+  eks_managed_node_groups = {}
 
   cluster_addons = {
     coredns = {
