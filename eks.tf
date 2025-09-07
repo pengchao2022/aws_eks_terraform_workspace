@@ -17,6 +17,8 @@ module "eks" {
   eks_managed_node_group_defaults = {
     ami_type       = "AL2_x86_64"  # 使用 Amazon Linux 2
     instance_types = [var.node_instance_type]
+    iam_role_use_name_prefix = false
+    iam_role_name = "node-${local.environment}"
     disk_size      = 20
   }
 
