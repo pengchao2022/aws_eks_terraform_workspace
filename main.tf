@@ -19,10 +19,9 @@ data "aws_ami" "amazon_linux_2" {
 }
 
 locals {
-  environment = terraform.workspace
-  name        = "${var.cluster_name}-${local.environment}"
-  node_names  = ["eks-python-node-1", "eks-python-node-2"]
-  
+  name        = var.cluster_name  # 直接使用集群名称，不重复添加环境
+  environment = var.environment
   # 使用 Amazon Linux 2 AMI
   ami_id = data.aws_ami.amazon_linux_2.id
-}
+  }
+
